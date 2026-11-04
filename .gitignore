@@ -1,0 +1,16 @@
+# Build
+zig-out/
+.zig-cache/
+zig-cache/
+
+# Local outputs and real media (never commit)
+out/
+testdata/real/
+*.wav
+!testdata/synthetic/*.wav
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
