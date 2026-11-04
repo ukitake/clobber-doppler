@@ -14,7 +14,7 @@ pub const Wav = struct {
 pub fn readFile(allocator: std.mem.Allocator, path: []const u8) !Wav {
     const file = try std.fs.cwd().openFile(path, .{});
     defer file.close();
-    const data = try file.readToEndAlloc(allocator, 512 * 1024 * 1024);
+    const data = try file.readToEndAlloc(allocator, 1024 * 1024 * 1024);
     defer allocator.free(data);
     return try parse(allocator, data);
 }
@@ -125,6 +125,48 @@ pub fn writeFile(path: []const u8, sample_rate: u32, channels: u16, samples: []c
         try w.writeInt(i16, v, .little);
     }
     try buffered.flush();
+}
+
+/// Split interleaved frames into one buffer per channel.
+pub fn deinterleave(allocator: std.mem.Allocator, samples: []const f32, channels: u16) ![][]f32 {
+    const ch_count: usize = channels;
+    if (ch_count == 0) return error.InvalidChannelCount;
+    const frames = samples.len / ch_count;
+    const planar = try allocator.alloc([]f32, ch_count);
+    errdefer allocator.free(planar);
+    var filled: usize = 0;
+    errdefer {
+        var i: usize = 0;
+        while (i < filled) : (i += 1) allocator.free(planar[i]);
+    }
+
+    var c: usize = 0;
+    while (c < ch_count) : (c += 1) {
+        const ch = try allocator.alloc(f32, frames);
+        var i: usize = 0;
+        while (i < frames) : (i += 1) {
+            ch[i] = samples[i * ch_count + c];
+        }
+        planar[c] = ch;
+        filled += 1;
+    }
+    return planar;
+}
+
+/// Interleave channel buffers. Uses the shortest channel if lengths differ.
+pub fn interleave(allocator: std.mem.Allocator, planar: []const []f32) ![]f32 {
+    if (planar.len == 0) return error.InvalidChannelCount;
+    var frames = planar[0].len;
+    for (planar) |ch| frames = @min(frames, ch.len);
+    const out = try allocator.alloc(f32, frames * planar.len);
+    var i: usize = 0;
+    while (i < frames) : (i += 1) {
+        var c: usize = 0;
+        while (c < planar.len) : (c += 1) {
+            out[i * planar.len + c] = planar[c][i];
+        }
+    }
+    return out;
 }
 
 /// Downmix interleaved to mono (allocated).

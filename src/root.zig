@@ -1,20 +1,17 @@
 const std = @import("std");
 const Config = @import("config.zig").Config;
 const Stft = @import("stft.zig").Stft;
-const Tracker = @import("tracker.zig").Tracker;
 const mask_mod = @import("mask.zig");
 
 pub const fft = @import("fft.zig");
 pub const config = @import("config.zig");
 pub const stft = @import("stft.zig");
-pub const tracker = @import("tracker.zig");
 pub const mask = @import("mask.zig");
 
 const DopplerScrub = struct {
     allocator: std.mem.Allocator,
     cfg: Config,
     stft_engine: Stft,
-    ridge: Tracker,
     mask_bins: []f32,
     flushing: bool,
     flush_hops_left: u32,
@@ -38,27 +35,18 @@ export fn doppler_scrub_create(cfg_in: *const Config) callconv(.C) ?*DopplerScru
         allocator.destroy(self);
         return null;
     };
-    const ridge = Tracker.init(allocator, cfg) catch {
-        var tmp = stft_engine;
-        tmp.deinit();
-        allocator.destroy(self);
-        return null;
-    };
     const mask_bins = allocator.alloc(f32, cfg.fft_size / 2 + 1) catch {
-        var r = ridge;
-        r.deinit();
         var s = stft_engine;
         s.deinit();
         allocator.destroy(self);
         return null;
     };
-    @memset(mask_bins, 1.0);
+    mask_mod.fillBlankBand(mask_bins, cfg.sample_rate, cfg.fft_size, cfg.track_f_min_hz, cfg.track_f_max_hz);
 
     self.* = .{
         .allocator = allocator,
         .cfg = cfg,
         .stft_engine = stft_engine,
-        .ridge = ridge,
         .mask_bins = mask_bins,
         .flushing = false,
         .flush_hops_left = 0,
@@ -69,14 +57,12 @@ export fn doppler_scrub_create(cfg_in: *const Config) callconv(.C) ?*DopplerScru
 export fn doppler_scrub_destroy(h: ?*DopplerScrub) callconv(.C) void {
     const self = h orelse return;
     self.stft_engine.deinit();
-    self.ridge.deinit();
     self.allocator.free(self.mask_bins);
     self.allocator.destroy(self);
 }
 
 fn processAvailableFrames(self: *DopplerScrub) void {
     while (self.stft_engine.analyzeFrame()) {
-        self.ridge.updateAndBuildMask(self.stft_engine.spectrum, self.mask_bins);
         mask_mod.applyMaskPreservePhase(self.stft_engine.spectrum, self.cfg.fft_size, self.mask_bins, self.cfg.wet);
         self.stft_engine.synthesizeFrame() catch {};
     }
@@ -152,54 +138,36 @@ test {
     _ = fft;
     _ = @import("config.zig");
     _ = @import("mask.zig");
-    _ = @import("tracker.zig");
     _ = @import("stft.zig");
 }
 
-test "scrub attenuates synthetic doppler ridge" {
+test "blank band removes 40-200 Hz and keeps a higher tone" {
     const allocator = std.testing.allocator;
     const sr: u32 = 16000;
     var cfg = Config.initDefaults(sr);
     cfg.fft_size = 2048;
     cfg.hop_size = 512;
     cfg.track_f_min_hz = 40;
-    cfg.track_f_max_hz = 450;
-    cfg.mask_depth_db = 48;
-    cfg.mask_half_width_hz = 10;
+    cfg.track_f_max_hz = 200;
     try cfg.validate();
 
-    // Generate ~2s of S-curve Doppler ridge + noise
+    // Steady in-band tone plus a tone well above the blank.
     const n_samples: usize = sr * 2;
     const input = try allocator.alloc(f32, n_samples);
     defer allocator.free(input);
-    var prng = std.Random.DefaultPrng.init(42);
-    const rand = prng.random();
-
-    // Proper phase accumulation for S-curve Doppler ridge + 2nd harmonic
-    var ph0: f64 = 0;
-    var ph1: f64 = 0;
     var n: usize = 0;
     while (n < n_samples) : (n += 1) {
         const t = @as(f64, @floatFromInt(n)) / @as(f64, @floatFromInt(sr));
-        const phase_s = std.math.tanh((t - 1.0) * 2.5);
-        const f0 = 200.0 + 120.0 * phase_s;
-        const f1 = 2.0 * f0;
-        ph0 += 2.0 * std.math.pi * f0 / @as(f64, @floatFromInt(sr));
-        ph1 += 2.0 * std.math.pi * f1 / @as(f64, @floatFromInt(sr));
-        const noise = (rand.float(f32) * 2.0 - 1.0) * 0.05;
-        input[n] = @floatCast(0.6 * @sin(ph0) + 0.25 * @sin(ph1) + noise);
+        input[n] = @floatCast(0.6 * @sin(2.0 * std.math.pi * 120.0 * t) + 0.4 * @sin(2.0 * std.math.pi * 1000.0 * t));
     }
 
-    // Run scrub via STFT path directly (same as C ABI)
     var engine = try Stft.init(allocator, cfg);
     defer engine.deinit();
-    var ridge = try Tracker.init(allocator, cfg);
-    defer ridge.deinit();
     const mask_bins = try allocator.alloc(f32, cfg.fft_size / 2 + 1);
     defer allocator.free(mask_bins);
+    mask_mod.fillBlankBand(mask_bins, cfg.sample_rate, cfg.fft_size, cfg.track_f_min_hz, cfg.track_f_max_hz);
 
     try engine.pushInput(input);
-    // Pad for flush
     const pad = try allocator.alloc(f32, cfg.fft_size);
     defer allocator.free(pad);
     @memset(pad, 0);
@@ -208,24 +176,25 @@ test "scrub attenuates synthetic doppler ridge" {
     const output = try allocator.alloc(f32, n_samples + cfg.fft_size);
     defer allocator.free(output);
     @memset(output, 0);
-    var out_n: usize = 0;
 
     while (engine.analyzeFrame()) {
-        ridge.updateAndBuildMask(engine.spectrum, mask_bins);
         mask_mod.applyMaskPreservePhase(engine.spectrum, cfg.fft_size, mask_bins, 1.0);
         try engine.synthesizeFrame();
     }
-    out_n = engine.popOutput(output);
+    const out_n = engine.popOutput(output);
 
-    // Compare band energy 60–400 Hz via periodogram on middle 1s
-    const mid_start = sr / 2;
-    const mid_len = sr;
-    const in_e = bandEnergy(input[mid_start .. mid_start + mid_len], sr, 60, 400);
-    const out_slice_len = @min(mid_len, out_n);
-    const out_e = bandEnergy(output[0..out_slice_len], sr, 60, 400);
+    const latency = cfg.fft_size - cfg.hop_size;
+    const region = sr / 2;
+    try std.testing.expect(out_n > latency + region + 2048);
+    const out_aligned = output[latency..];
 
-    // Expect substantial attenuation of the ridge band
-    try std.testing.expect(out_e < in_e * 0.35);
+    const in_lo = bandEnergy(input[region..], sr, 80, 160);
+    const out_lo = bandEnergy(out_aligned[region..], sr, 80, 160);
+    const in_hi = bandEnergy(input[region..], sr, 800, 1200);
+    const out_hi = bandEnergy(out_aligned[region..], sr, 800, 1200);
+
+    try std.testing.expect(out_lo < in_lo * 0.05);
+    try std.testing.expect(out_hi > in_hi * 0.5);
 }
 
 fn bandEnergy(samples: []const f32, sample_rate: u32, f_lo: f32, f_hi: f32) f32 {
