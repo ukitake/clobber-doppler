@@ -63,6 +63,6 @@ pub fn build(b: *std.Build) void {
     });
     unit_tests.linkLibC();
     const run_unit_tests = b.addRunArtifact(unit_tests);
-    const test_step = b.step("test", "Run DSP unit tests (40-200 Hz blank band)");
+    const test_step = b.step("test", "Run DSP unit tests (Doppler ridge scrub)");
     test_step.dependOn(&run_unit_tests.step);
 }

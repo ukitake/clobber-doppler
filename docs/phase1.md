@@ -1,6 +1,6 @@
 # Phase 1 — CLI Doppler scrub proof
 
-Prove a 40–200 Hz spectral blank on static files with before/after spectrograms.
+Prove STFT Doppler-ridge scrubbing on static files with before/after spectrograms.
 
 ## Build
 
@@ -44,5 +44,5 @@ Do **not** commit anything under `testdata/real/` or `out/`.
 
 ## Core API
 
-See `include/doppler_scrub.h`. Chunked real-time STFT that zeros 40–200 Hz,
-OLA reconstruct, phase preserved outside that band.
+See `include/doppler_scrub.h`. Chunked real-time STFT with causal ridge tracking
+(~40–450 Hz + harmonics), spectral mask, OLA reconstruct, phase preserved.

@@ -80,7 +80,7 @@ pub fn main() !void {
     cfg.wet = wet;
     try cfg.validate();
 
-    // Same blank on every channel, then pack back to the input layout.
+    // Same ridge mask on every channel, then pack back to the input layout.
     var c: usize = 0;
     while (c < planar.len) : (c += 1) {
         const scrubbed_ch = try scrubMono(allocator, planar[c], cfg);
@@ -142,9 +142,10 @@ pub fn main() !void {
 fn scrubMono(allocator: std.mem.Allocator, mono: []const f32, cfg: Config) ![]f32 {
     var engine = try doppler.stft.Stft.init(allocator, cfg);
     defer engine.deinit();
+    var ridge = try doppler.tracker.Tracker.init(allocator, cfg);
+    defer ridge.deinit();
     const mask_bins = try allocator.alloc(f32, cfg.fft_size / 2 + 1);
     defer allocator.free(mask_bins);
-    doppler.mask.fillBlankBand(mask_bins, cfg.sample_rate, cfg.fft_size, cfg.track_f_min_hz, cfg.track_f_max_hz);
 
     // Stream in chunks to exercise chunked path
     const chunk: usize = cfg.hop_size;
@@ -153,6 +154,7 @@ fn scrubMono(allocator: std.mem.Allocator, mono: []const f32, cfg: Config) ![]f3
         const end = @min(offset + chunk, mono.len);
         try engine.pushInput(mono[offset..end]);
         while (engine.analyzeFrame()) {
+            ridge.updateAndBuildMask(engine.spectrum, mask_bins);
             doppler.mask.applyMaskPreservePhase(engine.spectrum, cfg.fft_size, mask_bins, cfg.wet);
             try engine.synthesizeFrame();
         }
@@ -164,6 +166,7 @@ fn scrubMono(allocator: std.mem.Allocator, mono: []const f32, cfg: Config) ![]f3
     while (h < flush_hops) : (h += 1) {
         try engine.pushSilenceHop();
         while (engine.analyzeFrame()) {
+            ridge.updateAndBuildMask(engine.spectrum, mask_bins);
             doppler.mask.applyMaskPreservePhase(engine.spectrum, cfg.fft_size, mask_bins, cfg.wet);
             try engine.synthesizeFrame();
         }
@@ -237,7 +240,7 @@ fn generateSynthetic(allocator: std.mem.Allocator) !void {
 
 fn usage() void {
     std.debug.print(
-        \\doppler-cli — blank the 40–200 Hz band
+        \\doppler-cli — Phase 1 Doppler ridge scrubber
         \\
         \\Usage:
         \\  doppler-cli --in <audio-or-video> --out <file> [--spectrogram-dir <dir>] [--wet 0..1] [--stem name]

@@ -25,7 +25,7 @@ See [docs/phase1.md](docs/phase1.md) for the showcase YouTube clip workflow.
 | Path | Role |
 |------|------|
 | `include/doppler_scrub.h` | C ABI |
-| `src/` | STFT, FFT, 40–200 Hz blank, mask, OLA |
+| `src/` | STFT, FFT, ridge tracker, mask, OLA |
 | `apps/cli/` | File scrubber + spectrograms |
 | `apps/obs/` | Deferred |
 | `apps/android/` | Deferred |

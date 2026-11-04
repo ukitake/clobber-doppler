@@ -14,13 +14,13 @@ typedef struct DopplerScrubConfig {
     uint32_t sample_rate;      /* Hz, e.g. 48000 */
     uint32_t fft_size;         /* power of two, default 8192 */
     uint32_t hop_size;         /* default fft_size/4 */
-    float track_f_min_hz;      /* blank-band low edge, default 40 */
-    float track_f_max_hz;      /* blank-band high edge, default 200 */
-    uint32_t max_harmonics;    /* unused; kept for ABI layout */
-    float mask_depth_db;       /* unused; kept for ABI layout */
-    float mask_half_width_hz;  /* unused; kept for ABI layout */
+    float track_f_min_hz;      /* default 40 */
+    float track_f_max_hz;      /* default 450 */
+    uint32_t max_harmonics;    /* default 4 (fundamental + 3) */
+    float mask_depth_db;       /* attenuation at ridge center, default 72 */
+    float mask_half_width_hz;  /* notch half-width, default 18 */
     float wet;                 /* 0=dry 1=full scrub, default 1 */
-    uint32_t max_tracks;       /* unused; kept for ABI layout */
+    uint32_t max_tracks;       /* default 8 */
 } DopplerScrubConfig;
 
 /* Fill config with recommended Phase-1 defaults for sample_rate. */
