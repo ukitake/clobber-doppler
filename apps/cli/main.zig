@@ -1,6 +1,7 @@
 const std = @import("std");
 const doppler = @import("doppler_scrub");
 const wav = @import("wav.zig");
+const media = @import("media.zig");
 const spectrogram = @import("spectrogram.zig");
 
 const Config = doppler.config.Config;
@@ -54,7 +55,7 @@ pub fn main() !void {
     const ip = in_path orelse return usage();
     const op = out_path orelse return usage();
 
-    var audio = try wav.readFile(allocator, ip);
+    var audio = try media.load(allocator, ip);
     var audio_live = true;
     defer if (audio_live) audio.deinit();
     const sample_rate = audio.sample_rate;
@@ -92,11 +93,7 @@ pub fn main() !void {
     allocator.free(planar);
     planar_live = false;
 
-    // Ensure out dir exists
-    if (std.fs.path.dirname(op)) |dir| {
-        std.fs.cwd().makePath(dir) catch {};
-    }
-    try wav.writeFile(op, sample_rate, channels, scrubbed);
+    try media.writeOutput(allocator, ip, op, sample_rate, channels, scrubbed);
     const n_frames = scrubbed.len / channels;
     std.debug.print("wrote {s} ({d} frames, {d} ch @ {d} Hz)\n", .{ op, n_frames, channels, sample_rate });
 
@@ -243,8 +240,13 @@ fn usage() void {
         \\doppler-cli — blank the 40–200 Hz band
         \\
         \\Usage:
-        \\  doppler-cli --in <wav> --out <wav> [--spectrogram-dir <dir>] [--wet 0..1] [--stem name]
+        \\  doppler-cli --in <audio-or-video> --out <file> [--spectrogram-dir <dir>] [--wet 0..1] [--stem name]
         \\  doppler-cli gen-synthetic
+        \\
+        \\WAV input is read directly. Other audio files, and video files, are decoded
+        \\with ffmpeg (first audio stream, channels and sample rate kept). .wav output
+        \\is PCM. Any other output extension is encoded with ffmpeg. Video outputs copy
+        \\the picture and replace the audio. ffmpeg must be on PATH, or set FFMPEG.
         \\
     , .{});
 }
