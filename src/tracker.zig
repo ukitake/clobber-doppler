@@ -14,7 +14,7 @@ pub const Tracker = struct {
     cfg: Config,
     tracks: []Track,
     allocator: std.mem.Allocator,
-    /// Soft magnitudes reused each frame (half spectrum).
+    /// Squared bin power in the track band, reused each frame.
     scratch_mag: []f32,
 
     pub fn init(allocator: std.mem.Allocator, cfg: Config) !Tracker {
@@ -35,31 +35,30 @@ pub const Tracker = struct {
         self.allocator.free(self.scratch_mag);
     }
 
-    /// Update tracks from complex spectrum (interleaved re/im, length 2*fft_size).
+    /// Update tracks from a packed real spectrum (`[DC, Nyquist, re1, im1, ...]`, length fft_size).
     /// Fills `mask_bins` (same length as half-spectrum) with attenuation gains in [gain_floor, 1].
     pub fn updateAndBuildMask(self: *Tracker, spectrum: []const f32, mask_bins: []f32) void {
         const n = self.cfg.fft_size;
         const half = n / 2 + 1;
-        std.debug.assert(spectrum.len >= n * 2);
+        std.debug.assert(spectrum.len >= n);
         std.debug.assert(mask_bins.len >= half);
 
         const bin_hz = self.cfg.binHz();
         const b_lo = self.cfg.hzToBin(self.cfg.track_f_min_hz);
-        const b_hi = self.cfg.hzToBin(self.cfg.track_f_max_hz);
+        const b_hi = @min(self.cfg.hzToBin(self.cfg.track_f_max_hz), half - 1);
 
-        // Magnitudes
-        var i: usize = 0;
-        while (i < half) : (i += 1) {
-            const re = spectrum[2 * i];
-            const im = spectrum[2 * i + 1];
-            self.scratch_mag[i] = @sqrt(re * re + im * im);
+        // Power in the track band, plus one bin either side so peak tests can read neighbors.
+        const fill_lo = if (b_lo == 0) 0 else b_lo - 1;
+        const fill_hi = @min(b_hi + 1, half - 1);
+        var bin: usize = fill_lo;
+        while (bin <= fill_hi) : (bin += 1) {
+            self.scratch_mag[bin] = binPower(spectrum, n, bin);
         }
 
-        // Noise floor estimate in track band (median-ish via mean of lower half after sort of samples)
         var floor_acc: f32 = 0;
         var floor_n: f32 = 0;
-        i = b_lo;
-        while (i <= b_hi and i < half) : (i += 1) {
+        var i: usize = b_lo;
+        while (i <= b_hi) : (i += 1) {
             floor_acc += self.scratch_mag[i];
             floor_n += 1;
         }
@@ -229,6 +228,20 @@ pub const Tracker = struct {
         }
     }
 };
+
+fn binPower(spectrum: []const f32, fft_size: usize, bin: usize) f32 {
+    if (bin == 0) {
+        const re = spectrum[0];
+        return re * re;
+    }
+    if (bin == fft_size / 2) {
+        const re = spectrum[1];
+        return re * re;
+    }
+    const re = spectrum[2 * bin];
+    const im = spectrum[2 * bin + 1];
+    return re * re + im * im;
+}
 
 fn applyNotch(mask_bins: []f32, center_bin: f32, half_width_bins: f32, depth_lin: f32) void {
     const flat = @max(half_width_bins * 0.55, 1.0); // bins at full depth

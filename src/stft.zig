@@ -5,128 +5,172 @@ const Config = @import("config.zig").Config;
 pub const Stft = struct {
     cfg: Config,
     allocator: std.mem.Allocator,
+    real: fft.RealFft,
     window: []f32,
-    analysis: []f32, // time-domain windowed frame
-    spectrum: []f32, // interleaved complex
-    ola: []f32, // overlap-add buffer
+    time: []align(32) f32,
+    /// Packed real spectrum: [DC, Nyquist, re1, im1, ...], length fft_size.
+    spectrum: []align(32) f32,
+    work: []align(32) f32,
+    ola: []f32,
+    silence: []f32,
     input_fifo: std.ArrayList(f32),
+    input_read: usize,
     output_fifo: std.ArrayList(f32),
+    output_read: usize,
     ola_pos: usize,
     frames_pushed: usize,
 
     pub fn init(allocator: std.mem.Allocator, cfg: Config) !Stft {
-        const n = cfg.fft_size;
+        const n: usize = cfg.fft_size;
+        const hop: usize = cfg.hop_size;
+        var real = try fft.RealFft.init(n);
+        errdefer real.deinit();
+
         const window = try allocator.alloc(f32, n);
-        // Hann window (periodic) with COLA-friendly scale for 75% overlap (hop=n/4)
+        errdefer allocator.free(window);
+        // Hann window (periodic). Synthesis divides by the hop=n/4 COLA gain.
         var i: usize = 0;
         while (i < n) : (i += 1) {
             const t = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(n));
             window[i] = 0.5 - 0.5 * @cos(2.0 * std.math.pi * t);
         }
-        // For hop = n/4, Hann COLA sum ≈ 1.5; normalize synthesis by hop coherency later.
-        const analysis = try allocator.alloc(f32, n);
-        @memset(analysis, 0);
-        const spectrum = try allocator.alloc(f32, n * 2);
+
+        const time = try allocator.alignedAlloc(f32, 32, n);
+        errdefer allocator.free(time);
+        const spectrum = try allocator.alignedAlloc(f32, 32, n);
+        errdefer allocator.free(spectrum);
+        const work = try allocator.alignedAlloc(f32, 32, n);
+        errdefer allocator.free(work);
+        @memset(time, 0);
         @memset(spectrum, 0);
+        @memset(work, 0);
+
         const ola = try allocator.alloc(f32, n);
+        errdefer allocator.free(ola);
         @memset(ola, 0);
 
+        const silence = try allocator.alloc(f32, hop);
+        errdefer allocator.free(silence);
+        @memset(silence, 0);
+
         var input_fifo = std.ArrayList(f32).init(allocator);
+        errdefer input_fifo.deinit();
         try input_fifo.ensureTotalCapacity(n * 2);
         var output_fifo = std.ArrayList(f32).init(allocator);
+        errdefer output_fifo.deinit();
         try output_fifo.ensureTotalCapacity(n * 2);
 
         return .{
             .cfg = cfg,
             .allocator = allocator,
+            .real = real,
             .window = window,
-            .analysis = analysis,
+            .time = time,
             .spectrum = spectrum,
+            .work = work,
             .ola = ola,
+            .silence = silence,
             .input_fifo = input_fifo,
+            .input_read = 0,
             .output_fifo = output_fifo,
+            .output_read = 0,
             .ola_pos = 0,
             .frames_pushed = 0,
         };
     }
 
     pub fn deinit(self: *Stft) void {
+        self.real.deinit();
         self.allocator.free(self.window);
-        self.allocator.free(self.analysis);
+        self.allocator.free(self.time);
         self.allocator.free(self.spectrum);
+        self.allocator.free(self.work);
         self.allocator.free(self.ola);
+        self.allocator.free(self.silence);
         self.input_fifo.deinit();
         self.output_fifo.deinit();
     }
 
     pub fn pushInput(self: *Stft, samples: []const f32) !void {
+        self.compactInput();
         try self.input_fifo.appendSlice(samples);
     }
 
     pub fn framesReady(self: *const Stft) bool {
-        return self.input_fifo.items.len >= self.cfg.fft_size;
+        return self.inputAvailable() >= self.cfg.fft_size;
     }
 
-    /// Analyze next hop: window → FFT into self.spectrum. Returns false if not enough input.
+    pub fn inputAvailable(self: *const Stft) usize {
+        return self.input_fifo.items.len - self.input_read;
+    }
+
+    pub fn outputAvailable(self: *const Stft) usize {
+        return self.output_fifo.items.len - self.output_read;
+    }
+
+    /// Analyze next hop: window → real FFT into self.spectrum. Returns false if not enough input.
     pub fn analyzeFrame(self: *Stft) bool {
         const n = self.cfg.fft_size;
         const hop = self.cfg.hop_size;
-        if (self.input_fifo.items.len < n) return false;
+        if (self.inputAvailable() < n) return false;
 
-        @memcpy(self.analysis[0..n], self.input_fifo.items[0..n]);
-        // Advance hop
-        const remain = self.input_fifo.items.len - hop;
-        std.mem.copyForwards(f32, self.input_fifo.items[0..remain], self.input_fifo.items[hop..]);
-        self.input_fifo.shrinkRetainingCapacity(remain);
-
-        @memset(self.spectrum, 0);
+        const src = self.input_fifo.items[self.input_read..][0..n];
         var i: usize = 0;
         while (i < n) : (i += 1) {
-            self.spectrum[2 * i] = self.analysis[i] * self.window[i];
-            self.spectrum[2 * i + 1] = 0;
+            self.time[i] = src[i] * self.window[i];
         }
-        fft.fft(self.spectrum, n, false);
+        self.input_read += hop;
+        self.real.forward(self.time, self.spectrum, self.work);
         self.frames_pushed += 1;
         return true;
     }
 
-    /// After mask applied to spectrum, IFFT + OLA into output fifo.
+    /// After the mask is applied to spectrum, inverse FFT + OLA into the output fifo.
     pub fn synthesizeFrame(self: *Stft) !void {
         const n = self.cfg.fft_size;
         const hop = self.cfg.hop_size;
-        fft.fft(self.spectrum, n, true);
+        self.real.backward(self.spectrum, self.time, self.work);
 
-        // Window again (WOLA) and normalize for hop=n/4 Hann (COLA ≈ 1.5)
-        const cola_norm: f32 = 1.5;
+        // WOLA. pffft is unnormalized (backward = n * forward), and Hann at hop n/4 sums to 1.5.
+        const scale = 1.0 / (@as(f32, @floatFromInt(n)) * 1.5);
         var i: usize = 0;
         while (i < n) : (i += 1) {
-            const s = self.spectrum[2 * i] * self.window[i] / cola_norm;
-            self.ola[i] += s;
+            self.ola[i] += self.time[i] * self.window[i] * scale;
         }
 
-        // Emit hop samples from front of OLA
         try self.output_fifo.appendSlice(self.ola[0..hop]);
-        // Shift OLA left by hop
         const remain = n - hop;
         std.mem.copyForwards(f32, self.ola[0..remain], self.ola[hop..n]);
         @memset(self.ola[remain..n], 0);
     }
 
     pub fn popOutput(self: *Stft, dest: []f32) usize {
-        const n = @min(dest.len, self.output_fifo.items.len);
+        const n = @min(dest.len, self.outputAvailable());
         if (n == 0) return 0;
-        @memcpy(dest[0..n], self.output_fifo.items[0..n]);
-        const remain = self.output_fifo.items.len - n;
-        std.mem.copyForwards(f32, self.output_fifo.items[0..remain], self.output_fifo.items[n..]);
-        self.output_fifo.shrinkRetainingCapacity(remain);
+        @memcpy(dest[0..n], self.output_fifo.items[self.output_read..][0..n]);
+        self.output_read += n;
+        self.compactOutput();
         return n;
     }
 
-    /// Push silence hops to drain OLA (for flush).
+    /// Push one hop of silence to drain the OLA (for flush).
     pub fn pushSilenceHop(self: *Stft) !void {
-        const zeros = try self.allocator.alloc(f32, self.cfg.hop_size);
-        defer self.allocator.free(zeros);
-        @memset(zeros, 0);
-        try self.pushInput(zeros);
+        try self.pushInput(self.silence);
+    }
+
+    fn compactInput(self: *Stft) void {
+        if (self.input_read < self.cfg.fft_size) return;
+        const remain = self.input_fifo.items.len - self.input_read;
+        std.mem.copyForwards(f32, self.input_fifo.items[0..remain], self.input_fifo.items[self.input_read..]);
+        self.input_fifo.shrinkRetainingCapacity(remain);
+        self.input_read = 0;
+    }
+
+    fn compactOutput(self: *Stft) void {
+        if (self.output_read < self.cfg.fft_size) return;
+        const remain = self.output_fifo.items.len - self.output_read;
+        std.mem.copyForwards(f32, self.output_fifo.items[0..remain], self.output_fifo.items[self.output_read..]);
+        self.output_fifo.shrinkRetainingCapacity(remain);
+        self.output_read = 0;
     }
 };

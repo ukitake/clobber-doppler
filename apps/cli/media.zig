@@ -4,116 +4,328 @@ const wav = @import("wav.zig");
 
 const video_exts = [_][]const u8{ "mp4", "m4v", "mov", "mkv", "webm", "avi", "mpg", "mpeg", "ts", "m2ts", "wmv", "flv", "3gp" };
 
-/// Load audio from a WAV, or from any ffmpeg-readable audio or video file.
-/// Channel count and sample rate are preserved. Video pictures are not loaded.
-pub fn load(allocator: std.mem.Allocator, path: []const u8) !wav.Wav {
+pub const Input = struct {
+    allocator: std.mem.Allocator,
+    stream: wav.StreamIn,
+    /// Heap file for a direct WAV read. Null when ffmpeg owns the handle.
+    file: ?*std.fs.File = null,
+    child: ?*std.process.Child = null,
+    ffmpeg_path: ?[]u8 = null,
+
+    pub fn readFrames(self: *Input, dest: []f32) !usize {
+        return self.stream.readFrames(dest);
+    }
+
+    /// Reap a decoder after the caller has read to EOF. A direct WAV file is a no-op.
+    pub fn finish(self: *Input) !void {
+        const child = self.child orelse return;
+        const term = try child.wait();
+        switch (term) {
+            .Exited => |code| if (code != 0) return error.FfmpegFailed,
+            else => return error.FfmpegFailed,
+        }
+    }
+
+    pub fn close(self: *Input) void {
+        self.stream.deinit();
+        if (self.child) |child| {
+            if (child.term == null) {
+                _ = child.kill() catch |err| switch (err) {
+                    error.AlreadyTerminated => _ = child.wait() catch {},
+                    else => {},
+                };
+            }
+            self.allocator.destroy(child);
+            self.child = null;
+        }
+        if (self.file) |file| {
+            file.close();
+            self.allocator.destroy(file);
+            self.file = null;
+        }
+        if (self.ffmpeg_path) |path| self.allocator.free(path);
+    }
+};
+
+pub const Output = struct {
+    allocator: std.mem.Allocator,
+    partial: []u8,
+    final_path: []u8,
+    wav: ?wav.StreamOut = null,
+    child: ?*std.process.Child = null,
+    ffmpeg_path: ?[]u8 = null,
+    owned_argv: ?[][]const u8 = null,
+    owned_rate: ?[]u8 = null,
+    owned_channels: ?[]u8 = null,
+    finished: bool = false,
+
+    pub fn writeFrames(self: *Output, samples: []const f32) !void {
+        if (self.wav) |*out| {
+            try out.writeFrames(samples);
+            return;
+        }
+        const child = self.child orelse return error.BadPathName;
+        const file = child.stdin orelse return error.BrokenPipe;
+        try writeAll(file, std.mem.sliceAsBytes(samples));
+    }
+
+    pub fn finish(self: *Output) !void {
+        if (self.wav) |*out| {
+            try out.finish();
+        } else if (self.child) |child| {
+            if (child.stdin) |in| {
+                in.close();
+                child.stdin = null;
+            }
+            const term = try child.wait();
+            switch (term) {
+                .Exited => |code| if (code != 0) return error.FfmpegFailed,
+                else => return error.FfmpegFailed,
+            }
+        }
+        std.fs.deleteFileAbsolute(self.final_path) catch {};
+        try std.fs.renameAbsolute(self.partial, self.final_path);
+        self.finished = true;
+    }
+
+    pub fn close(self: *Output) void {
+        if (self.wav) |*out| {
+            out.deinit();
+            self.wav = null;
+        }
+        if (self.child) |child| {
+            if (child.term == null) {
+                if (child.stdin) |in| {
+                    in.close();
+                    child.stdin = null;
+                }
+                _ = child.kill() catch |err| switch (err) {
+                    error.AlreadyTerminated => _ = child.wait() catch {},
+                    else => {},
+                };
+            }
+            self.allocator.destroy(child);
+            self.child = null;
+        }
+        if (!self.finished) std.fs.deleteFileAbsolute(self.partial) catch {};
+        self.allocator.free(self.partial);
+        self.allocator.free(self.final_path);
+        if (self.ffmpeg_path) |path| self.allocator.free(path);
+        if (self.owned_argv) |argv| self.allocator.free(argv);
+        if (self.owned_rate) |rate| self.allocator.free(rate);
+        if (self.owned_channels) |ch| self.allocator.free(ch);
+    }
+};
+
+pub fn openInput(allocator: std.mem.Allocator, path: []const u8) !Input {
     if (hasExt(path, &.{ "wav", "wave" })) {
-        if (wav.readFile(allocator, path)) |audio| {
-            return audio;
+        if (openWavInput(allocator, path)) |input| {
+            return input;
         } else |err| switch (err) {
             error.InvalidWav, error.UnsupportedFormat, error.MissingData => {},
             else => return err,
         }
     }
     if (!fileExists(path)) return error.FileNotFound;
-    return decodeToWav(allocator, path);
+    return openFfmpegInput(allocator, path);
 }
 
-/// Write scrubbed samples. `.wav` stays PCM. Any other extension is encoded
-/// with ffmpeg. Video containers keep the source picture and replace the audio.
-pub fn writeOutput(
+fn openWavInput(allocator: std.mem.Allocator, path: []const u8) !Input {
+    const file = try std.fs.cwd().openFile(path, .{});
+    const slot = try allocator.create(std.fs.File);
+    slot.* = file;
+    const stream = wav.openStream(allocator, readHandle, slot) catch |err| {
+        slot.close();
+        allocator.destroy(slot);
+        return err;
+    };
+    return .{
+        .allocator = allocator,
+        .stream = stream,
+        .file = slot,
+    };
+}
+
+fn openFfmpegInput(allocator: std.mem.Allocator, path: []const u8) !Input {
+    const ffmpeg = try resolveFfmpeg(allocator);
+    const child = try allocator.create(std.process.Child);
+    child.* = std.process.Child.init(&.{
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-nostdin",
+        "-i",
+        path,
+        "-vn",
+        "-map",
+        "0:a:0",
+        "-c:a",
+        "pcm_f32le",
+        "-f",
+        "wav",
+        "pipe:1",
+    }, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Inherit;
+    child.spawn() catch |err| {
+        allocator.destroy(child);
+        allocator.free(ffmpeg);
+        if (err == error.FileNotFound) return error.FfmpegNotFound;
+        return err;
+    };
+    std.debug.print("decoding {s}\n", .{path});
+    const stream = wav.openStream(allocator, readChildStdout, child) catch |err| {
+        _ = child.kill() catch {};
+        allocator.destroy(child);
+        allocator.free(ffmpeg);
+        return err;
+    };
+    return .{
+        .allocator = allocator,
+        .stream = stream,
+        .child = child,
+        .ffmpeg_path = ffmpeg,
+    };
+}
+
+pub fn openOutput(
     allocator: std.mem.Allocator,
     source_path: []const u8,
     out_path: []const u8,
     sample_rate: u32,
     channels: u16,
-    samples: []const f32,
-) !void {
+) !Output {
     if (std.fs.path.dirname(out_path)) |dir| {
         std.fs.cwd().makePath(dir) catch {};
     }
+    const abs_out = try absolutePath(allocator, out_path);
+    errdefer allocator.free(abs_out);
+    const partial = try partialPath(allocator, abs_out);
+    errdefer allocator.free(partial);
+
     if (hasExt(out_path, &.{ "wav", "wave" })) {
-        try wav.writeFile(out_path, sample_rate, channels, samples);
-        return;
+        const stream = wav.StreamOut.create(allocator, partial, sample_rate, channels) catch |err| {
+            std.fs.deleteFileAbsolute(partial) catch {};
+            return err;
+        };
+        return .{
+            .allocator = allocator,
+            .partial = partial,
+            .final_path = abs_out,
+            .wav = stream,
+        };
     }
 
-    const tmp = try tempWavPath(allocator);
-    defer allocator.free(tmp);
-    errdefer std.fs.deleteFileAbsolute(tmp) catch {};
-    try wav.writeFile(tmp, sample_rate, channels, samples);
-    defer std.fs.deleteFileAbsolute(tmp) catch {};
-
-    const abs_out = try absolutePath(allocator, out_path);
-    defer allocator.free(abs_out);
-    const dest = try partialPath(allocator, abs_out);
-    defer allocator.free(dest);
-    errdefer std.fs.deleteFileAbsolute(dest) catch {};
-
-    if (hasExt(out_path, &video_exts)) {
+    const ffmpeg = try resolveFfmpeg(allocator);
+    const video = hasExt(out_path, &video_exts);
+    if (video) {
         std.debug.print("muxing scrubbed audio into {s}\n", .{out_path});
-        try muxVideo(allocator, source_path, tmp, dest, out_path);
     } else {
         std.debug.print("encoding {s}\n", .{out_path});
-        try encodeAudio(allocator, tmp, dest, out_path);
     }
-
-    std.fs.deleteFileAbsolute(abs_out) catch {};
-    try std.fs.renameAbsolute(dest, abs_out);
+    return spawnEncoder(allocator, ffmpeg, abs_out, partial, source_path, sample_rate, channels, video);
 }
 
-fn decodeToWav(allocator: std.mem.Allocator, path: []const u8) !wav.Wav {
-    const tmp = try tempWavPath(allocator);
-    defer allocator.free(tmp);
-    defer std.fs.deleteFileAbsolute(tmp) catch {};
-    std.debug.print("decoding {s}\n", .{path});
-    try runFfmpeg(allocator, &.{
-        "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
-        "-i",         path,
-        "-vn",        "-map",        "0:a:0",
-        "-c:a",       "pcm_s16le",   tmp,
-    });
-    return wav.readFile(allocator, tmp);
-}
-
-fn muxVideo(
+fn spawnEncoder(
     allocator: std.mem.Allocator,
+    ffmpeg: []u8,
+    abs_out: []u8,
+    partial: []u8,
     source_path: []const u8,
-    scrubbed_wav: []const u8,
-    dest: []const u8,
-    out_path: []const u8,
-) !void {
-    const codec = videoAudioCodec(out_path);
+    sample_rate: u32,
+    channels: u16,
+    video: bool,
+) !Output {
+    errdefer allocator.free(ffmpeg);
+    const rate = try std.fmt.allocPrint(allocator, "{d}", .{sample_rate});
+    errdefer allocator.free(rate);
+    const ch_s = try std.fmt.allocPrint(allocator, "{d}", .{channels});
+    errdefer allocator.free(ch_s);
+
     var args: std.ArrayList([]const u8) = std.ArrayList([]const u8).init(allocator);
     defer args.deinit();
-    try args.appendSlice(&.{
-        "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
-        "-i",           source_path,
-        "-i",           scrubbed_wav,
-        "-map",         "0:v?",
-        "-map",         "1:a:0",
-        "-c:v",         "copy",
-        "-c:a",         codec,
-    });
-    try appendBitrate(&args, codec);
-    try args.append(dest);
-    try runFfmpeg(allocator, args.items);
+    if (video) {
+        const codec = videoAudioCodec(partial);
+        try args.appendSlice(&.{
+            ffmpeg,
+            "-hide_banner", "-loglevel", "error", "-y",
+            "-i",           source_path,
+            "-f",           "f32le",
+            "-ar",          rate,
+            "-ac",          ch_s,
+            "-i",           "pipe:0",
+            "-map",         "0:v?",
+            "-map",         "1:a:0",
+            "-c:v",         "copy",
+            "-c:a",         codec,
+        });
+        try appendBitrate(&args, codec);
+    } else {
+        try args.appendSlice(&.{
+            ffmpeg,
+            "-hide_banner", "-loglevel", "error", "-y",
+            "-f",           "f32le",
+            "-ar",          rate,
+            "-ac",          ch_s,
+            "-i",           "pipe:0",
+        });
+        try appendAudioCodec(&args, partial);
+    }
+    try args.append(partial);
+
+    // Child.init does not copy argv. Duplicate the list into memory owned by the child allocator
+    // and keep rate/ch_s alive for the process lifetime by leaking them into the same allocation
+    // strategy: store them beside the child and free in close().
+    const argv = try allocator.alloc([]const u8, args.items.len);
+    errdefer allocator.free(argv);
+    @memcpy(argv, args.items);
+
+    const child = try allocator.create(std.process.Child);
+    child.* = std.process.Child.init(argv, allocator);
+    child.stdin_behavior = .Pipe;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Inherit;
+    child.spawn() catch |err| {
+        allocator.destroy(child);
+        std.fs.deleteFileAbsolute(partial) catch {};
+        if (err == error.FileNotFound) return error.FfmpegNotFound;
+        return err;
+    };
+
+    return .{
+        .allocator = allocator,
+        .partial = partial,
+        .final_path = abs_out,
+        .child = child,
+        .ffmpeg_path = ffmpeg,
+        // rate, ch_s, and argv must stay alive. Stash them by appending to a side channel
+        // stored in the child argv (already pointing at argv). Free argv, rate, and ch_s in close.
+        .owned_argv = argv,
+        .owned_rate = rate,
+        .owned_channels = ch_s,
+    };
 }
 
-fn encodeAudio(
-    allocator: std.mem.Allocator,
-    scrubbed_wav: []const u8,
-    dest: []const u8,
-    out_path: []const u8,
-) !void {
-    var args: std.ArrayList([]const u8) = std.ArrayList([]const u8).init(allocator);
-    defer args.deinit();
-    try args.appendSlice(&.{
-        "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
-        "-i",           scrubbed_wav,
-    });
-    try appendAudioCodec(&args, out_path);
-    try args.append(dest);
-    try runFfmpeg(allocator, args.items);
+fn readHandle(ctx: *anyopaque, buf: []u8) anyerror!usize {
+    const file: *std.fs.File = @ptrCast(@alignCast(ctx));
+    return file.read(buf);
+}
+
+fn readChildStdout(ctx: *anyopaque, buf: []u8) anyerror!usize {
+    const child: *std.process.Child = @ptrCast(@alignCast(ctx));
+    const file = child.stdout orelse return error.Closed;
+    return file.read(buf);
+}
+
+fn writeAll(file: std.fs.File, bytes: []const u8) !void {
+    var off: usize = 0;
+    while (off < bytes.len) {
+        const n = try file.write(bytes[off..]);
+        if (n == 0) return error.BrokenPipe;
+        off += n;
+    }
 }
 
 fn appendAudioCodec(args: *std.ArrayList([]const u8), out_path: []const u8) !void {
@@ -152,40 +364,6 @@ fn appendBitrate(args: *std.ArrayList([]const u8), codec: []const u8) !void {
     }
 }
 
-fn runFfmpeg(allocator: std.mem.Allocator, args: []const []const u8) !void {
-    const ffmpeg = resolveFfmpeg(allocator) catch |err| {
-        std.debug.print("ffmpeg was not found. Install it, put it on PATH, or set FFMPEG to the executable.\n", .{});
-        return err;
-    };
-    defer allocator.free(ffmpeg);
-
-    var argv: std.ArrayList([]const u8) = std.ArrayList([]const u8).init(allocator);
-    defer argv.deinit();
-    try argv.append(ffmpeg);
-    try argv.appendSlice(args);
-
-    var child = std.process.Child.init(argv.items, allocator);
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Inherit;
-    const term = child.spawnAndWait() catch |err| {
-        if (err == error.FileNotFound) {
-            std.debug.print("could not start {s}\n", .{ffmpeg});
-            return error.FfmpegNotFound;
-        }
-        return err;
-    };
-    switch (term) {
-        .Exited => |code| if (code != 0) {
-            std.debug.print("ffmpeg exited with status {d}\n", .{code});
-            return error.FfmpegFailed;
-        },
-        else => {
-            std.debug.print("ffmpeg did not exit cleanly\n", .{});
-            return error.FfmpegFailed;
-        },
-    }
-}
-
 fn resolveFfmpeg(allocator: std.mem.Allocator) ![]u8 {
     if (std.process.getEnvVarOwned(allocator, "FFMPEG")) |from_env| {
         if (fileExists(from_env)) return from_env;
@@ -202,6 +380,7 @@ fn resolveFfmpeg(allocator: std.mem.Allocator) ![]u8 {
         if (try findUnderLocalAppData(allocator, &.{ "Microsoft", "WinGet", "Packages" }, "ffmpeg.exe")) |found| return found;
         if (try findProgramFiles(allocator)) |found| return found;
     }
+    std.debug.print("ffmpeg was not found. Install it, put it on PATH, or set FFMPEG to the executable.\n", .{});
     return error.FfmpegNotFound;
 }
 
@@ -254,33 +433,6 @@ fn findProgramFiles(allocator: std.mem.Allocator) !?[]u8 {
         allocator.free(candidate);
     }
     return null;
-}
-
-fn tempWavPath(allocator: std.mem.Allocator) ![]u8 {
-    const dir = try tempDir(allocator);
-    defer allocator.free(dir);
-    const name = try std.fmt.allocPrint(allocator, "doppler-{d}-{d}.wav", .{
-        std.time.milliTimestamp(),
-        tempSeq(),
-    });
-    defer allocator.free(name);
-    return std.fs.path.join(allocator, &.{ dir, name });
-}
-
-var temp_seq: u32 = 0;
-fn tempSeq() u32 {
-    temp_seq += 1;
-    return temp_seq;
-}
-
-fn tempDir(allocator: std.mem.Allocator) ![]u8 {
-    if (std.process.getEnvVarOwned(allocator, "TEMP")) |p| {
-        return p;
-    } else |_| {}
-    if (std.process.getEnvVarOwned(allocator, "TMPDIR")) |p| {
-        return p;
-    } else |_| {}
-    return std.fs.cwd().realpathAlloc(allocator, ".");
 }
 
 fn partialPath(allocator: std.mem.Allocator, abs_out: []const u8) ![]u8 {

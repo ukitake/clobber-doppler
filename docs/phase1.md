@@ -1,12 +1,18 @@
 # Phase 1 — CLI Doppler scrub proof
 
-Prove STFT Doppler-ridge scrubbing on static files with before/after spectrograms.
+Prove STFT Doppler-ridge scrubbing on static files.
 
 ## Build
 
 ```bash
 zig build
 zig build test
+```
+
+Release builds are much faster on long files:
+
+```bash
+zig build -Doptimize=ReleaseFast
 ```
 
 Artifacts land in `zig-out/bin/doppler-cli` and `zig-out/lib/`.
@@ -17,9 +23,7 @@ Artifacts land in `zig-out/bin/doppler-cli` and `zig-out/lib/`.
 ./zig-out/bin/doppler-cli gen-synthetic
 ./zig-out/bin/doppler-cli \
   --in testdata/synthetic/doppler_scurve_48k.wav \
-  --out out/synthetic-scrubbed.wav \
-  --spectrogram-dir out \
-  --stem synthetic
+  --out out/synthetic-scrubbed.wav
 ```
 
 ## Showcase clip (gitignored media)
@@ -35,9 +39,7 @@ ffmpeg -y -ss 660 -t 120 -i testdata/real/full.wav testdata/real/showcase.wav
 
 ./zig-out/bin/doppler-cli \
   --in testdata/real/showcase.wav \
-  --out out/showcase-scrubbed.wav \
-  --spectrogram-dir out \
-  --stem showcase
+  --out out/showcase-scrubbed.wav
 ```
 
 Do **not** commit anything under `testdata/real/` or `out/`.
@@ -46,3 +48,5 @@ Do **not** commit anything under `testdata/real/` or `out/`.
 
 See `include/doppler_scrub.h`. Chunked real-time STFT with causal ridge tracking
 (~40–450 Hz + harmonics), spectral mask, OLA reconstruct, phase preserved.
+The file CLI scrubs long inputs in overlapping chunks across a thread pool.
+pffft (FFTPACK license, see `third_party/pffft/LICENSE`) performs the FFTs.

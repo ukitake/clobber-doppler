@@ -44,7 +44,7 @@ size_t doppler_scrub_process(
 /* Drain remaining OLA tail. Returns frames written. Call until returns 0. */
 size_t doppler_scrub_flush(DopplerScrub *h, float *out, size_t out_capacity);
 
-/* Introspection for spectrogram tooling / tests. */
+/* Introspection for hosts and tests. */
 uint32_t doppler_scrub_fft_size(const DopplerScrub *h);
 uint32_t doppler_scrub_hop_size(const DopplerScrub *h);
 uint32_t doppler_scrub_sample_rate(const DopplerScrub *h);

@@ -9,6 +9,7 @@ pub const config = @import("config.zig");
 pub const stft = @import("stft.zig");
 pub const tracker = @import("tracker.zig");
 pub const mask = @import("mask.zig");
+pub const scrub = @import("scrub.zig");
 
 const DopplerScrub = struct {
     allocator: std.mem.Allocator,
@@ -117,7 +118,7 @@ export fn doppler_scrub_flush(
         self.flush_hops_left = hops;
     }
 
-    while (self.flush_hops_left > 0 and self.stft_engine.output_fifo.items.len < out_capacity) {
+    while (self.flush_hops_left > 0 and self.stft_engine.outputAvailable() < out_capacity) {
         self.stft_engine.pushSilenceHop() catch break;
         processAvailableFrames(self);
         self.flush_hops_left -= 1;
@@ -154,6 +155,7 @@ test {
     _ = @import("mask.zig");
     _ = @import("tracker.zig");
     _ = @import("stft.zig");
+    _ = @import("scrub.zig");
 }
 
 test "scrub attenuates synthetic doppler ridge" {

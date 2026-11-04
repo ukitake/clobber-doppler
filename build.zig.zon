@@ -12,6 +12,7 @@
         "apps",
         "testdata",
         "docs",
+        "third_party",
         "LICENSE",
         "README.md",
     },
